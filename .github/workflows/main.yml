@@ -1,0 +1,304 @@
+name: RDP 2026 (Windows 11)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+      backup_number:
+        description: "MuMu Backup Number (1, 2, 3...)"
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  full:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: Automation King Taz
+      RDP_PASS: 1234@AutomationKingTaz
+      BACKUP_LIST_URL: https://myitagency.com/yari/mumubackupurl.txt
+
+    steps:
+
+    # ---------------- BASIC ----------------
+    - name: Show runner info
+      shell: pwsh
+      run: |
+        whoami
+        systeminfo | findstr /B /C:"OS Name"
+
+    # ---------------- TAILSCALE ----------------
+    - name: Install and Start Tailscale
+      shell: pwsh
+      run: |
+        $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+        if (-not (Test-Path $exe)) {
+          Invoke-WebRequest `
+            https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi `
+            -OutFile tailscale.msi
+          Start-Process msiexec.exe -ArgumentList "/i tailscale.msi /quiet /norestart" -Wait
+        }
+
+        Start-Service Tailscale
+        Start-Sleep 10
+
+        & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet"
+
+        for ($i=0; $i -lt 10; $i++) {
+          $ip = & $exe ip -4 | Select-Object -First 1
+          if ($ip) { break }
+          Start-Sleep 3
+        }
+
+        if (-not $ip) { throw "Tailscale IP not found" }
+
+        echo "TS_IP=$ip" >> $env:GITHUB_ENV
+        Write-Host "Tailscale IP: $ip"
+
+    # ---------------- RDP + USER PROFILE ----------------
+    - name: Enable RDP and Create User Profile
+      shell: pwsh
+      run: |
+        $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+
+        if (-not (Get-LocalUser $env:RDP_USER -EA SilentlyContinue)) {
+          New-LocalUser $env:RDP_USER -Password $sec
+          Add-LocalGroupMember Administrators $env:RDP_USER
+          Add-LocalGroupMember "Remote Desktop Users" $env:RDP_USER
+        }
+
+        Set-ItemProperty `
+          "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+          -Name fDenyTSConnections -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+        # ─── User Profile Force Create ───
+        Write-Host "Creating user profile..."
+
+        Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        using System.Text;
+        public class ProfileHelper {
+            [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern int CreateProfile(
+                string pszUserSid,
+                string pszUserName,
+                StringBuilder pszProfilePath,
+                uint cchProfilePath);
+        }
+        "@
+
+        $user = Get-LocalUser $env:RDP_USER
+        $sid  = $user.SID.Value
+        $pathBuilder = New-Object System.Text.StringBuilder 260
+
+        $result = [ProfileHelper]::CreateProfile($sid, $env:RDP_USER, $pathBuilder, 260)
+        $profilePath = $pathBuilder.ToString()
+
+        if ($profilePath -and (Test-Path $profilePath)) {
+          $desktop = "$profilePath\Desktop"
+        } else {
+          $desktop = "C:\Users\$($env:RDP_USER)\Desktop"
+          New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+        }
+
+        if (-not (Test-Path $desktop)) {
+          New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+        }
+
+        icacls $desktop /grant "${env:RDP_USER}:(OI)(CI)F" /T /Q
+
+        Write-Host "Desktop path: $desktop"
+        echo "USER_DESKTOP=$desktop" >> $env:GITHUB_ENV
+
+    # ---------------- IP & SERIAL LOG ----------------
+    - name: Show IP and Serial
+      shell: pwsh
+      run: |
+        Write-Host ""
+        Write-Host "=========================================="
+        Write-Host "  $env:TS_IP  |  ${{ inputs.backup_number }}"
+        Write-Host "=========================================="
+        Write-Host ""
+
+    # ============================================================
+    #      FETCH TXT + PARALLEL DOWNLOAD
+    # ============================================================
+    - name: "Download All Files (Backup #${{ inputs.backup_number }})"
+      shell: pwsh
+      run: |
+        $desktop = $env:USER_DESKTOP
+        $num     = "${{ inputs.backup_number }}"
+
+        Write-Host "Saving to: $desktop"
+        Write-Host ""
+
+        # ──────────────────────────────────────────
+        #  External TXT ফাইল থেকে backup list আনো
+        # ──────────────────────────────────────────
+        Write-Host "Fetching backup list from server..."
+        $txtContent = (Invoke-WebRequest -Uri $env:BACKUP_LIST_URL -UseBasicParsing).Content
+        $lines = $txtContent -split "`n" | Where-Object { $_.Trim() -ne "" }
+
+        Write-Host "Total backups found in list: $($lines.Count)"
+        Write-Host ""
+
+        # ──────────────────────────────────────────
+        #  নির্বাচিত নম্বর খুঁজে বের করো
+        # ──────────────────────────────────────────
+        $found = $false
+        $backupName = ""
+        $backupUrl  = ""
+
+        foreach ($line in $lines) {
+          $parts = $line.Trim() -split "\|"
+          if ($parts.Count -ge 3 -and $parts[0].Trim() -eq $num) {
+            $backupName = $parts[1].Trim()
+            $backupUrl  = $parts[2].Trim()
+            $found = $true
+            break
+          }
+        }
+
+        if (-not $found) {
+          throw "Backup number $num not found in mumubackupurl.txt!"
+        }
+
+        # ──────────────────────────────────────────
+        #  Common URLs (6 files total now)
+        # ──────────────────────────────────────────
+        $mumuUrl     = "https://myitagency.com/yari/MuMu.exe"
+        $zipUrl      = "https://myitagency.com/yari/YariFinal.zip"
+        $restoreUrl  = "https://myitagency.com/yari/Restore.bat"
+        $cdownUrl    = "https://myitagency.com/yari/cDown.bat"
+        $startUrl    = "https://myitagency.com/yari/start.bat"
+
+        Write-Host "=========================================="
+        Write-Host "DOWNLOAD PLAN"
+        Write-Host "=========================================="
+        Write-Host "1. MuMu.exe"
+        Write-Host "2. YariFinal.zip -> Extract -> Delete zip"
+        Write-Host "3. $backupName"
+        Write-Host "4. Restore.bat"
+        Write-Host "5. cDown.bat"
+        Write-Host "6. start.bat"
+        Write-Host "=========================================="
+        Write-Host ""
+
+        # ──────────────────────────────────────────
+        #  6টি ফাইল PARALLEL ডাউনলোড
+        # ──────────────────────────────────────────
+        Write-Host "Starting 6 parallel downloads..."
+        Write-Host ""
+
+        $job1 = Start-Job -Name "MuMu" -ScriptBlock {
+          param($url, $dest)
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+        } -ArgumentList $mumuUrl, "$desktop\MuMu.exe"
+
+        $job2 = Start-Job -Name "YariFinal" -ScriptBlock {
+          param($url, $dest)
+          $zipPath = "$dest\YariFinal.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+          Expand-Archive -Path $zipPath -DestinationPath "$dest\YariFinal" -Force
+          Remove-Item $zipPath -Force
+        } -ArgumentList $zipUrl, $desktop
+
+        $job3 = Start-Job -Name "Backup" -ScriptBlock {
+          param($url, $dest)
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+        } -ArgumentList $backupUrl, "$desktop\$backupName"
+
+        $job4 = Start-Job -Name "RestoreTxt" -ScriptBlock {
+          param($url, $dest)
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+        } -ArgumentList $restoreUrl, "$desktop\Restore.bat"
+
+        $job5 = Start-Job -Name "CDownBat" -ScriptBlock {
+          param($url, $dest)
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+        } -ArgumentList $cdownUrl, "$desktop\cDown.bat"
+
+        $job6 = Start-Job -Name "StartBat" -ScriptBlock {
+          param($url, $dest)
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+        } -ArgumentList $startUrl, "$desktop\start.bat"
+
+        # ──────────────────────────────────────────
+        #  সব Job শেষ হওয়ার জন্য অপেক্ষা
+        # ──────────────────────────────────────────
+        Write-Host "Waiting for all downloads to finish..."
+        Write-Host ""
+
+        $allJobs = @($job1, $job2, $job3, $job4, $job5, $job6)
+        $allJobs | Wait-Job
+
+        foreach ($j in $allJobs) {
+          if ($j.State -eq "Completed") {
+            Write-Host "[OK] $($j.Name) — Done!"
+          } else {
+            Write-Host "[FAIL] $($j.Name) — Failed!"
+            Receive-Job $j
+          }
+        }
+
+        $allJobs | Remove-Job -Force
+
+        Write-Host ""
+        Write-Host "=========================================="
+        Write-Host "DESKTOP FILES:"
+        Write-Host "=========================================="
+        Get-ChildItem $desktop -Recurse -Depth 1 | Format-Table FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} -AutoSize
+
+    # ---------------- PYTHON ----------------
+    - name: Install Python modules
+      shell: pwsh
+      run: |
+        python -m pip install --upgrade pip
+        pip install customtkinter
+        pip install uiautomator2
+        pip install opencv-python
+        pip install playwright
+        playwright install
+
+    # ---------------- KEEP ALIVE ----------------
+    - name: Keep alive
+      shell: pwsh
+      run: |
+        Write-Host ""
+        Write-Host "=========================================="
+        Write-Host "  $env:TS_IP  |  ${{ inputs.backup_number }}"
+        Write-Host "=========================================="
+        Write-Host ""
+        Write-Host "RDP INFO"
+        Write-Host "  Username : $env:RDP_USER"
+        Write-Host "  Password : $env:RDP_PASS"
+        Write-Host ""
+        Write-Host "Desktop : $env:USER_DESKTOP"
+        Write-Host ""
+        Write-Host "Files Ready:"
+        Write-Host "  MuMu.exe"
+        Write-Host "  YariFinal (Extracted)"
+        Write-Host "  Backup #${{ inputs.backup_number }}"
+        Write-Host "  Restore.bat"
+        Write-Host "  cDown.bat"
+        Write-Host "  start.bat"
+        Write-Host ""
+        Write-Host "VM alive for 6 hours..."
+        Write-Host ""
+
+        Start-Sleep -Seconds 21600
+
+    - name: Done
+      shell: pwsh
+      run: |
+        Write-Host "DONE"
+        Write-Host "$env:TS_IP  |  ${{ inputs.backup_number }}"
